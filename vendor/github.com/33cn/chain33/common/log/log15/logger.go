@@ -6,18 +6,22 @@ package log15
 
 import (
 	"fmt"
+	"os"
 	"time"
+	"bytes"
 
+	"go.uber.org/multierr"
 	"github.com/go-stack/stack"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
-
-const timeKey = "t"
-const lvlKey = "lvl"
-const msgKey = "msg"
-const errorKey = "LOG15_ERROR"
 
 // Lvl is a type for predefined log levels.
 type Lvl int
+
+var (
+	DefaultLog *zap.Logger
+)
 
 // List of predefined log Levels
 const (
@@ -27,6 +31,70 @@ const (
 	LvlInfo
 	LvlDebug
 )
+
+func init() {
+	// 日志输出等级
+	lvl, _ := LvlFromString("debug")
+
+	// 设置日志级别
+	atomicLevel := zap.NewAtomicLevel()
+	atomicLevel.SetLevel(lvl)
+
+	encoderConfig := SetLc()
+	core := zapcore.NewCore(zapcore.NewJSONEncoder(encoderConfig), zapcore.WriteSyncer(zapcore.AddSync(os.Stdout)), atomicLevel)
+
+	DefaultLog = zap.New(core)
+}
+
+type ZapLogger struct {
+	_log   *zap.Logger
+	fields []Field
+}
+
+type Handler struct {}
+
+func (l ZapLogger) SetHandler(h Handler) {}
+
+func DiscardHandler() Handler {
+	return Handler{}
+}
+
+type Logger interface {
+	New(ctx ...interface{}) ZapLogger
+
+	// Log a message at the given level with context key/value pairs
+	Debug(msg string, ctx ...interface{})
+	Info(msg string, ctx ...interface{})
+	Warn(msg string, ctx ...interface{})
+	Error(msg string, ctx ...interface{})
+	Crit(msg string, ctx ...interface{})
+}
+
+type Format interface {
+	Format(r *Record) []byte
+}
+
+func FormatFunc(f func(*Record) []byte) Format {
+	return formatFunc(f)
+}
+
+type formatFunc func(*Record) []byte
+
+func (f formatFunc) Format(r *Record) []byte {
+	return f(r)
+}
+
+func LogfmtFormat() Format {
+	return FormatFunc(func(r *Record) []byte {
+		//common := []interface{}{r.KeyNames.Time, r.Time, r.KeyNames.Lvl, r.Lvl, r.KeyNames.Msg, r.Msg}
+		buf := &bytes.Buffer{}
+		return buf.Bytes()
+	})
+}
+
+type Lazy struct {
+	Fn interface{}
+}
 
 // Returns the name of a Lvl
 func (l Lvl) String() string {
@@ -48,20 +116,18 @@ func (l Lvl) String() string {
 
 // LvlFromString returns the appropriate Lvl from a string name.
 // Useful for parsing command line args and configuration files.
-func LvlFromString(lvlString string) (Lvl, error) {
+func LvlFromString(lvlString string) (zapcore.Level, error) {
 	switch lvlString {
 	case "debug", "dbug":
-		return LvlDebug, nil
+		return zapcore.DebugLevel, nil
 	case "info":
-		return LvlInfo, nil
+		return zapcore.InfoLevel, nil
 	case "warn":
-		return LvlWarn, nil
-	case "error", "eror":
-		return LvlError, nil
-	case "crit":
-		return LvlCrit, nil
+		return zapcore.WarnLevel, nil
+	case "error", "eror", "crit":
+		return zapcore.ErrorLevel, nil
 	default:
-		return LvlDebug, fmt.Errorf("Unknown level: %v", lvlString)
+		return zapcore.DebugLevel, fmt.Errorf("Unknown level: %v", lvlString)
 	}
 }
 
@@ -82,149 +148,176 @@ type RecordKeyNames struct {
 	Lvl  string
 }
 
-// A Logger writes key/value pairs to a Handler
-type Logger interface {
-	// New returns a new Logger that has this logger's context plus the given context
-	New(ctx ...interface{}) Logger
+func getLogger() *zap.Logger {
+	if DefaultLog == nil {
+		// 日志输出等级
+		lvl, _ := LvlFromString("debug")
 
-	// GetHandler gets the handler associated with the logger.
-	GetHandler() Handler
+		// 设置日志级别
+		atomicLevel := zap.NewAtomicLevel()
+		atomicLevel.SetLevel(lvl)
 
-	// SetHandler updates the logger to write records to the specified handler.
-	SetHandler(h Handler)
+		encoderConfig := SetLc()
+		core := zapcore.NewCore(zapcore.NewJSONEncoder(encoderConfig), zapcore.WriteSyncer(zapcore.AddSync(os.Stdout)), atomicLevel)
 
-	// Log a message at the given level with context key/value pairs
-	Debug(msg string, ctx ...interface{})
-	Info(msg string, ctx ...interface{})
-	Warn(msg string, ctx ...interface{})
-	Error(msg string, ctx ...interface{})
-	Crit(msg string, ctx ...interface{})
-	SetMaxLevel(int)
-}
-
-type logger struct {
-	ctx      []interface{}
-	h        *swapHandler
-	children []Logger
-	maxLevel int
-}
-
-func (l *logger) write(msg string, lvl Lvl, ctx []interface{}) {
-	if l.maxLevel < int(lvl) {
-		return
+		DefaultLog = zap.New(core)
 	}
-	l.h.Log(&Record{
-		Time: time.Now(),
-		Lvl:  lvl,
-		Msg:  msg,
-		Ctx:  newContext(l.ctx, ctx),
-		Call: stack.Caller(2),
-		KeyNames: RecordKeyNames{
-			Time: timeKey,
-			Msg:  msgKey,
-			Lvl:  lvlKey,
-		},
-	})
+	return DefaultLog.WithOptions(zap.AddCallerSkip(1))
 }
 
-func (l *logger) New(ctx ...interface{}) Logger {
-	child := &logger{newContext(l.ctx, ctx), new(swapHandler), nil, l.maxLevel}
-	child.SetHandler(l.h)
-	l.children = append(l.children, child)
-	return child
-}
-
-func (l *logger) SetMaxLevel(maxLevel int) {
-	l.maxLevel = maxLevel
-}
-
-func newContext(prefix []interface{}, suffix []interface{}) []interface{} {
-	normalizedSuffix := normalize(suffix)
-	newCtx := make([]interface{}, len(prefix)+len(normalizedSuffix))
-	n := copy(newCtx, prefix)
-	copy(newCtx[n:], normalizedSuffix)
-	return newCtx
-}
-
-func (l *logger) Debug(msg string, ctx ...interface{}) {
-	l.write(msg, LvlDebug, ctx)
-}
-
-func (l *logger) Info(msg string, ctx ...interface{}) {
-	l.write(msg, LvlInfo, ctx)
-}
-
-func (l *logger) Warn(msg string, ctx ...interface{}) {
-	l.write(msg, LvlWarn, ctx)
-}
-
-func (l *logger) Error(msg string, ctx ...interface{}) {
-	l.write(msg, LvlError, ctx)
-}
-
-func (l *logger) Crit(msg string, ctx ...interface{}) {
-	l.write(msg, LvlCrit, ctx)
-}
-
-func (l *logger) GetHandler() Handler {
-	return l.h.Get()
-}
-
-func (l *logger) SetHandler(h Handler) {
-	l.h.Swap(h)
-	l.maxLevel = h.MaxLevel()
-	for _, logger := range l.children {
-		logger.SetMaxLevel(l.maxLevel)
+func SetLc() zapcore.EncoderConfig {
+	//公用编码器
+	encoderConfig := zapcore.EncoderConfig{
+		TimeKey:        "time",
+		LevelKey:       "level",
+		NameKey:        "logger",
+		CallerKey:      "linenum",
+		MessageKey:     "msg",
+		StacktraceKey:  "stacktrace",
+		LineEnding:     zapcore.DefaultLineEnding,
+		EncodeLevel:    zapcore.CapitalLevelEncoder,    // 大写编码器
+		EncodeTime:     zapcore.ISO8601TimeEncoder,     // ISO8601 UTC 时间格式
+		EncodeDuration: zapcore.SecondsDurationEncoder, //
+		EncodeCaller:   zapcore.FullCallerEncoder,      // 全路径编码器
+		EncodeName:     zapcore.FullNameEncoder,
 	}
+
+	return encoderConfig
 }
 
-func normalize(ctx []interface{}) []interface{} {
-	// if the caller passed a Ctx object, then expand it
-	if len(ctx) == 1 {
-		if ctxMap, ok := ctx[0].(Ctx); ok {
-			ctx = ctxMap.toArray()
+func New(ctx ...interface{}) ZapLogger {
+	return ZapLogger{DefaultLog, ParseFields(ctx)}
+}
+
+func Debug(msg string, ctx ...interface{}) {
+	DefaultLog.Debug(msg, ParseFields(ctx)...)
+}
+
+func  Info(msg string, ctx ...interface{}) {
+	DefaultLog.Info(msg, ParseFields(ctx)...)
+}
+
+func Warn(msg string, ctx ...interface{}) {
+	DefaultLog.Warn(msg, ParseFields(ctx)...)
+}
+
+func  Error(msg string, ctx ...interface{}) {
+	DefaultLog.Error(msg, ParseFields(ctx)...)
+}
+
+func  Crit(msg string, ctx ...interface{}) {
+	DefaultLog.Error(msg, ParseFields(ctx)...)
+}
+
+func (l ZapLogger) New(ctx ...interface{}) ZapLogger {
+	fields := AppendFields(l.fields, ParseFields(ctx))
+	return ZapLogger{DefaultLog, fields}
+}
+
+func (l ZapLogger) Debug(msg string, ctx ...interface{}) {
+	fields := AppendFields(l.fields, ParseFields(ctx))
+	DefaultLog.Debug(msg, fields...)
+}
+
+func (l ZapLogger) Info(msg string, ctx ...interface{}) {
+	fields := AppendFields(l.fields, ParseFields(ctx))
+	DefaultLog.Info(msg, fields...)
+}
+
+func (l ZapLogger) Warn(msg string, ctx ...interface{}) {
+	fields := AppendFields(l.fields, ParseFields(ctx))
+	DefaultLog.Warn(msg, fields...)
+}
+
+func (l ZapLogger) Error(msg string, ctx ...interface{}) {
+	fields := AppendFields(l.fields, ParseFields(ctx))
+	DefaultLog.Error(msg, fields...)
+}
+
+func (l ZapLogger) Crit(msg string, ctx ...interface{}) {
+	fields := AppendFields(l.fields, ParseFields(ctx))
+	DefaultLog.Error(msg, fields...)
+}
+
+
+
+type Field = zapcore.Field
+
+func Any(key string, val interface{}) Field {
+	return zap.Any(key, val)
+}
+
+func AppendFields(prefix []Field, suffix []Field) []Field {
+	newFields := make([]Field, len(prefix)+len(suffix))
+	n := copy(newFields, prefix)
+	copy(newFields[n:], suffix)
+	return newFields
+}
+
+func ParseFields(args []interface{}) []Field {
+	if len(args) == 0 {
+		return nil
+	}
+
+	// Allocate enough space for the worst case; if users pass only structured
+	// fields, we shouldn't penalize them with extra allocations.
+	fields := make([]Field, 0, len(args))
+	var invalid invalidPairs
+
+	for i := 0; i < len(args); {
+		// This is a strongly-typed field. Consume it and move on.
+		if f, ok := args[i].(Field); ok {
+			fields = append(fields, f)
+			i++
+			continue
 		}
-	}
 
-	// ctx needs to be even because it's a series of key/value pairs
-	// no one wants to check for errors on logging functions,
-	// so instead of erroring on bad input, we'll just make sure
-	// that things are the right length and users can fix bugs
-	// when they see the output looks wrong
-	if len(ctx)%2 != 0 {
-		ctx = append(ctx, nil, errorKey, "Normalized odd number of arguments by adding nil")
-	}
+		// Make sure this element isn't a dangling key.
+		if i == len(args)-1 {
+			DefaultLog.DPanic("Ignored key without a value", zap.Any("ignored", args[i]))
+			break
+		}
 
-	return ctx
-}
-
-// Lazy allows you to defer calculation of a logged value that is expensive
-// to compute until it is certain that it must be evaluated with the given filters.
-//
-// Lazy may also be used in conjunction with a Logger's New() function
-// to generate a child logger which always reports the current value of changing
-// state.
-//
-// You may wrap any function which takes no arguments to Lazy. It may return any
-// number of values of any type.
-type Lazy struct {
-	Fn interface{}
-}
-
-// Ctx is a map of key/value pairs to pass as context to a log function
-// Use this only if you really need greater safety around the arguments you pass
-// to the logging functions.
-type Ctx map[string]interface{}
-
-func (c Ctx) toArray() []interface{} {
-	arr := make([]interface{}, len(c)*2)
-
-	i := 0
-	for k, v := range c {
-		arr[i] = k
-		arr[i+1] = v
+		// Consume this value and the next, treating them as a key-value pair. If the
+		// key isn't a string, add this pair to the slice of invalid pairs.
+		key, val := args[i], args[i+1]
+		if keyStr, ok := key.(string); !ok {
+			// Subsequent errors are likely, so allocate once up front.
+			if cap(invalid) == 0 {
+				invalid = make(invalidPairs, 0, len(args)/2)
+			}
+			invalid = append(invalid, invalidPair{i, key, val})
+		} else {
+			fields = append(fields, Any(keyStr, val))
+		}
 		i += 2
 	}
 
-	return arr
+	// If we encountered any invalid key-value pairs, log an error.
+	if len(invalid) > 0 {
+		DefaultLog.DPanic("Ignored key-value pairs with non-string keys", zap.Array("invalid", invalid))
+	}
+	return fields
+}
+
+type invalidPair struct {
+	position   int
+	key, value interface{}
+}
+
+func (p invalidPair) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	enc.AddInt64("position", int64(p.position))
+	Any("key", p.key).AddTo(enc)
+	Any("value", p.value).AddTo(enc)
+	return nil
+}
+
+type invalidPairs []invalidPair
+
+func (ps invalidPairs) MarshalLogArray(enc zapcore.ArrayEncoder) error {
+	var err error
+	for i := range ps {
+		err = multierr.Append(err, enc.AppendObject(ps[i]))
+	}
+	return err
 }
